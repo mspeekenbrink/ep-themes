@@ -1,0 +1,134 @@
+---
+title: "Research themes in UCL Experimental Psychology"
+author: "Maarten Speekenbrink"
+date: "29/01/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## The data
+
+```{r}
+library(dplyr)
+researcher_details <- read.csv("data/researcher_details.csv")
+all_papers <- read.csv("data/all_papers.csv")
+```
+
+We used `vestr` to scrape the https://www.ucl.ac.uk/pals/research/experimental-psychology/people/ website for the names of academics, and where available Google scholar IDs. For researchers for whom their Google scholar ID was not on the website, we searched Google scholar, using the name of the researcher, and UCL or University College London as affiliation. 
+
+## Researcher similarity based on latent semantic analysis
+
+```{r}
+library(LSAfun)
+load("data/TASA.rda")
+dat <- all_papers
+#dat$doc <- ""
+#dat$doc <- dat$title
+#dat %>%
+#  group_by(title,pubid) %>%
+#  summarise(n=n()) %>%
+#  filter(n>1)
+dat <- dat %>%
+  filter(!is.na(abstract)) %>%
+  mutate(doc = ifelse(!is.na(abstract),paste(title," ",abstract),title)) %>%
+  mutate(doc = LSAfun::breakdown(doc)) %>%
+  mutate(doc = stringr::str_trim(doc)) %>%
+  filter(nchar(doc) > 19)
+
+np <- nrow(dat)
+lsa_sim <- matrix(ncol=np, nrow=np)
+ids <- split(1:np, ceiling(seq_along(1:np)/100))
+for(i in 1:length(ids)) {
+  tmp <- LSAfun::multidocs(x=dat$doc[ids[[i]]],tvectors=TASA)
+  lsa_sim[ids[[i]],ids[[i]]] <- tmp$cosmat
+  if(i < length(ids)) {
+    for(j in (i+1):length(ids)) {
+      tmp <- LSAfun::multidocs(x=dat$doc[ids[[i]]],y=dat$doc[ids[[j]]],tvectors=TASA)
+      lsa_sim[ids[[i]],ids[[j]]] <- tmp$cosmat
+      lsa_sim[ids[[j]],ids[[i]]] <- t(tmp$cosmat)
+    }
+  }
+}
+save(lsa_sim, file="data/lsa_sim.RData")
+```
+
+```{r}
+ids <- split(1:np, factor(dat$name))
+na <- length(levels(factor(dat$name)))
+ave_lsa_sim <- matrix(ncol=na, nrow=na)
+for(i in 1:na) {
+  ave_lsa_sim[i,i] <- mean(lsa_sim[upper.tri(lsa_sim[ids[[i]],ids[[i]]])])
+  if(i < length(ids)) {
+     for(j in (i+1):length(ids)) {
+       ave_lsa_sim[j,i] <- ave_lsa_sim[i,j] <- mean(lsa_sim[ids[[i]],ids[[j]]])
+    }
+  }
+}
+colnames(ave_lsa_sim) <- rownames(ave_lsa_sim) <- names(ids)
+
+set.seed(12356)
+res_mds <- smacof::mds(sqrt(1-ave_lsa_sim), type="interval")
+plot(res_mds)
+```
+
+## Topic models
+
+```{r}
+# https://slcladal.github.io/topicmodels.html
+
+library(tm)
+corpus <- dat %>%
+  mutate(doc_id = row_number(),
+         text = doc) %>%
+  select(doc_id, text, author, journal, year, cid, pubid, name, scholar_id) %>%
+  tm::DataframeSource() %>%
+  tm::Corpus()
+
+english_stopwords <- readLines("https://slcladal.github.io/resources/stopwords_en.txt", encoding = "UTF-8")
+
+# Preprocessing chain
+processedCorpus <- tm_map(corpus, content_transformer(tolower))
+processedCorpus <- tm_map(processedCorpus, removeWords, english_stopwords)
+processedCorpus <- tm_map(processedCorpus, removePunctuation, preserve_intra_word_dashes = TRUE)
+processedCorpus <- tm_map(processedCorpus, removeNumbers)
+processedCorpus <- tm_map(processedCorpus, stemDocument, language = "en")
+processedCorpus <- tm_map(processedCorpus, stripWhitespace)
+
+minimumFrequency <- 5
+DTM <- DocumentTermMatrix(processedCorpus, control = list(bounds = list(global = c(minimumFrequency, Inf))))
+# have a look at the number of documents and terms in the matrix
+dim(DTM)
+
+sel_idx <- slam::row_sums(DTM) > 0
+DTM <- DTM[sel_idx, ]
+tdat <- dat[sel_idx, ]
+
+# number of topics
+K <- 30
+# set random number generator seed
+set.seed(9161)
+# compute the LDA model, inference via 1000 iterations of Gibbs sampling
+topicModel <- topicmodels::LDA(DTM, K, method="Gibbs", control=list(burnin = 1000, iter = 1000, verbose = 100))
+
+SEED <- 9161
+topicModel <- topicmodels::LDA(DTM, k=K, method="VEM", control = list(seed = SEED))
+
+tmResult <- topicmodels::posterior(topicModel)
+
+theta <- tmResult$topics
+beta <- tmResult$terms
+topicNames <- apply(lda::top.topic.words(beta, 5, by.score = T), 2, paste, collapse = " ")
+
+topicProportions <- colSums(theta) / nDocs(DTM)  # mean probabalities over all paragraphs
+names(topicProportions) <- topicNames     # assign the topic names we created before
+sort(topicProportions, decreasing = TRUE) # show summed proportions in decreased order
+soP <- sort(topicProportions, decreasing = TRUE)
+paste(round(soP, 5), ":", names(soP))
+
+## format of the resulting object
+#attributes(tmResult)
+#nTerms(DTM) 
+```
